@@ -1,0 +1,2074 @@
+#!/usr/bin/env bash
+#
+# system-update - safety-focused CachyOS and Arch Linux update utility
+#
+# Intentional limitations:
+# - Supports CachyOS and Arch Linux only.
+# - Does not manage firmware or update BIOS/UEFI.
+# - Does not manage Docker, pip, npm, cargo, gem, or ComfyUI.
+# - Does not scrub filesystems or repair package databases automatically.
+# - Does not create, remove, restore, or otherwise manage snapshots.
+# - Does not alter bootloaders or restart services automatically.
+# - Does not remove disabled service relics.
+# - Does not resolve AUR conflicts automatically.
+# - Cannot guarantee that every AUR package builds non-interactively.
+# - Does not decide how pacnew, pacsave, or pacorig files should be merged.
+# - Does not provide automatic rollback.
+#
+# The script intentionally avoids set -e. Every command whose failure matters is
+# handled explicitly so expected non-zero results do not terminate the run.
+#
+set -u -o pipefail
+
+# -----------------------------------------------------------------------------
+# Constants and configuration
+# -----------------------------------------------------------------------------
+
+# Script identification
+readonly SCRIPT_NAME="system-update"
+readonly SCRIPT_VERSION="3.1.0"
+
+# Storage thresholds (in MiB)
+readonly ROOT_BLOCK_MIB=1024          # Minimum free space on / before blocking updates
+readonly BOOT_WARN_MIB=200            # Warning threshold for /boot free space
+readonly BOOT_BLOCK_MIB=100           # Blocking threshold for /boot free space
+
+# Pacman paths
+readonly PACMAN_CONF="/etc/pacman.conf"
+readonly PACMAN_LOCK="/var/lib/pacman/db.lck"
+readonly PACMAN_DB_DIR="/var/lib/pacman"
+readonly PACMAN_CACHE_DIR="/var/cache/pacman/pkg"
+
+# Informant (Arch Linux news) configuration
+readonly INFORMANT_OVERRIDE_DIR="/etc/pacman.d/hooks"
+
+# AUR development package checking (disabled by default to avoid unwanted rebuilds)
+readonly AUR_CHECK_DEVEL="false"
+
+# Visual separator for output sections
+readonly SEPARATOR="------------------------------------------------------------------------"
+
+# -----------------------------------------------------------------------------
+# Global state variables
+# -----------------------------------------------------------------------------
+
+# Runtime mode (update, audit, plan, help, version)
+MODE="update"
+
+# Timestamp for duration calculation
+START_EPOCH=0
+
+# Temporary directory for all script artifacts
+TEMP_DIR=""
+
+# Lock file configuration
+LOCK_FILE=""
+LOCK_FD=""
+
+# Sudo credential keepalive process
+SUDO_KEEPALIVE_PID=""
+
+# Cleanup tracking to prevent duplicate cleanup
+CLEANUP_STARTED=0
+
+# Output formatting (color support)
+USE_COLOR=0
+C_RESET=""
+C_OK=""
+C_INFO=""
+C_WARN=""
+C_FAIL=""
+
+# Audit and safety tracking
+BLOCKING_FAILURES=0
+REQUIRED_MISSING=0
+
+# Kernel tracking
+RUNNING_KERNEL=""
+RUNNING_MODULE_DIR=""
+RUNNING_KERNEL_PACKAGE=""
+RUNNING_KERNEL_VERSION_BEFORE=""
+RUNNING_KERNEL_VERSION_AFTER=""
+REBOOT_REQUIRED="no"
+
+# Update discovery counters
+REPO_UPDATES_COUNT="unavailable"
+AUR_UPDATES_COUNT="unavailable"
+FLATPAK_SYSTEM_UPDATES_COUNT="unavailable"
+FLATPAK_USER_UPDATES_COUNT="unavailable"
+
+# Discovery success flags
+REPO_DISCOVERY_OK=0
+AUR_DISCOVERY_OK=0
+FLATPAK_SYSTEM_DISCOVERY_OK=0
+FLATPAK_USER_DISCOVERY_OK=0
+
+# Transaction status tracking
+REPO_TRANSACTION_STATUS="not run"
+AUR_TRANSACTION_STATUS="not run"
+FLATPAK_SYSTEM_TRANSACTION_STATUS="not run"
+FLATPAK_USER_TRANSACTION_STATUS="not run"
+
+# Flatpak state
+FLATPAK_SYSTEM_HAS_REFS=0
+FLATPAK_USER_HAS_REFS=0
+
+# Configuration file tracking
+CONFIG_HIGH_COUNT=0          # High-priority config files needing review
+CONFIG_TOTAL_COUNT=0         # Total config files needing review
+RELEVANT_FAILED_COUNT=0      # Important systemd units that failed
+IGNORED_FAILED_COUNT=0       # Disabled/stale systemd units that failed
+
+# Arch Linux news tracking
+UNREAD_NEWS_COUNT="unavailable"
+
+# Orphan package tracking
+ORPHANS_FOUND=0
+ORPHANS_REMOVED=0
+ORPHAN_REMOVAL_DECLINED="no"
+
+# News reading state
+NEWS_CHECK_OK=0
+NEWS_READ_DECLINED="no"
+
+# Message collections for summary
+declare -a WARNING_MESSAGES=()
+declare -a ERROR_MESSAGES=()
+declare -A WARNING_SEEN=()
+declare -A ERROR_SEEN=()
+declare -A BLOCKING_SEEN=()
+declare -A HAVE=()
+
+# Repository and service state arrays
+declare -a ENABLED_REPOS=()
+declare -a CONFIG_HIGH_FILES=()
+declare -a CONFIG_NORMAL_FILES=()
+declare -a RELEVANT_FAILED_UNITS=()
+declare -a IGNORED_FAILED_UNITS=()
+
+# Informant hook management
+declare -a INFORMANT_OVERRIDE_PATHS=()
+declare -a INFORMANT_OVERRIDE_BACKUPS=()
+declare -a INFORMANT_OVERRIDE_EXISTED=()
+declare -a INFORMANT_OVERRIDE_ACTIVE=()
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+# Display usage information
+usage() {
+    cat <<'EOF'
+Usage:
+  system-update
+  system-update --audit
+  system-update --plan
+  system-update --help
+  system-update --version
+
+Modes:
+  no option   Audit, discover, and safely apply system updates.
+  --audit     Run read-only health and configuration checks.
+  --plan      Audit and list pending repository, AUR, and Flatpak updates.
+  --help      Show this help.
+  --version   Show the installed script version.
+EOF
+}
+
+# Display version information
+version() {
+    printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+}
+
+# Parse command-line arguments and set MODE accordingly
+parse_args() {
+    if (( $# == 0 )); then
+        MODE="update"
+        return 0
+    fi
+
+    if (( $# != 1 )); then
+        printf '[FAIL] Exactly one mode option may be supplied.\n' >&2
+        usage >&2
+        return 2
+    fi
+
+    case "$1" in
+        --audit)
+            MODE="audit"
+            ;;
+        --plan)
+            MODE="plan"
+            ;;
+        --help)
+            MODE="help"
+            ;;
+        --version)
+            MODE="version"
+            ;;
+        *)
+            printf '[FAIL] Unknown option: %s\n' "$1" >&2
+            usage >&2
+            return 2
+            ;;
+    esac
+}
+
+# Initialize output formatting with color support detection
+init_output() {
+    if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
+        USE_COLOR=1
+        C_RESET=$'\033[0m'
+        C_OK=$'\033[32m'
+        C_INFO=$'\033[36m'
+        C_WARN=$'\033[33m'
+        C_FAIL=$'\033[31m'
+    fi
+}
+
+# Print a status message with optional color
+status() {
+    local label=$1
+    shift
+    local message=$*
+    local color=""
+
+    if (( USE_COLOR == 1 )); then
+        case "$label" in
+            OK) color=$C_OK ;;
+            INFO) color=$C_INFO ;;
+            WARN) color=$C_WARN ;;
+            FAIL) color=$C_FAIL ;;
+        esac
+    fi
+
+    if (( USE_COLOR == 1 )); then
+        printf '%b[%s]%b %s\n' "$color" "$label" "$C_RESET" "$message"
+    else
+        printf '[%s] %s\n' "$label" "$message"
+    fi
+}
+
+# Print a section header with separators
+section() {
+    printf '\n%s\n%s\n%s\n' "$SEPARATOR" "$1" "$SEPARATOR"
+}
+
+# Record a warning message (deduplicated by ID)
+record_warning() {
+    local id=$1
+    shift
+    local message=$*
+
+    if [[ -z "${WARNING_SEEN[$id]+x}" ]]; then
+        WARNING_SEEN["$id"]=1
+        WARNING_MESSAGES+=("$message")
+    fi
+}
+
+# Record an error message (deduplicated by ID)
+record_error() {
+    local id=$1
+    shift
+    local message=$*
+
+    if [[ -z "${ERROR_SEEN[$id]+x}" ]]; then
+        ERROR_SEEN["$id"]=1
+        ERROR_MESSAGES+=("$message")
+    fi
+}
+
+# Convenience functions for common status types
+ok() {
+    status "OK" "$*"
+}
+
+info() {
+    status "INFO" "$*"
+}
+
+warn() {
+    local id=$1
+    shift
+    local message=$*
+    record_warning "$id" "$message"
+    status "WARN" "$message"
+}
+
+error() {
+    local id=$1
+    shift
+    local message=$*
+    record_error "$id" "$message"
+    status "FAIL" "$message"
+}
+
+# Record and display a blocking error (prevents updates)
+blocking_error() {
+    local id=$1
+    shift
+    local message=$*
+
+    if [[ -z "${BLOCKING_SEEN[$id]+x}" ]]; then
+        BLOCKING_SEEN["$id"]=1
+        (( BLOCKING_FAILURES += 1 ))
+    fi
+    error "$id" "$message"
+}
+
+# Indent file content by 4 spaces (for cleaner output)
+indent_file() {
+    local file=$1
+    if [[ -s "$file" ]]; then
+        sed 's/^/    /' "$file"
+    fi
+}
+
+# Count non-empty lines in a file
+count_nonempty_lines() {
+    local file=$1
+    awk 'NF {count++} END {print count+0}' "$file"
+}
+
+# Get the system hostname using available tools
+get_hostname() {
+    local name=""
+
+    if command -v hostnamectl >/dev/null 2>&1; then
+        name=$(hostnamectl --static 2>/dev/null || true)
+    fi
+    if [[ -z "$name" ]] && command -v hostname >/dev/null 2>&1; then
+        name=$(hostname 2>/dev/null || true)
+    fi
+    if [[ -z "$name" ]]; then
+        name="unknown"
+    fi
+    printf '%s\n' "$name"
+}
+
+# Print script header with version and hostname
+print_header() {
+    printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+    printf 'Host: %s\n' "$(get_hostname)"
+    printf 'Mode: %s\n' "$MODE"
+}
+
+# -----------------------------------------------------------------------------
+# Locking and cleanup functions
+# -----------------------------------------------------------------------------
+
+# Acquire a process lock to prevent concurrent runs
+acquire_lock() {
+    local lock_dir="${XDG_RUNTIME_DIR:-/tmp}"
+
+    if [[ ! -d "$lock_dir" || ! -w "$lock_dir" ]]; then
+        lock_dir="/tmp"
+    fi
+
+    LOCK_FILE="${lock_dir}/${SCRIPT_NAME}-${UID}.lock"
+    if ! exec {LOCK_FD}>"$LOCK_FILE"; then
+        printf '[FAIL] Unable to open lock file: %s\n' "$LOCK_FILE" >&2
+        return 1
+    fi
+    if ! flock -n "$LOCK_FD"; then
+        printf '[FAIL] Another %s process is already running.\n' "$SCRIPT_NAME" >&2
+        return 1
+    fi
+}
+
+# Create a secure temporary directory
+create_temp_dir() {
+    TEMP_DIR=$(mktemp -d -t "${SCRIPT_NAME}.XXXXXXXX")
+    if [[ -z "$TEMP_DIR" || ! -d "$TEMP_DIR" ]]; then
+        printf '[FAIL] Unable to create a temporary directory.\n' >&2
+        return 1
+    fi
+}
+
+# Restore disabled Informant hooks to their original state
+restore_informant_hooks() {
+    local quiet=${1:-no}
+    local failed=0
+    local i
+    local override
+    local backup
+    local existed
+
+    for (( i=${#INFORMANT_OVERRIDE_PATHS[@]}-1; i>=0; i-- )); do
+        [[ "${INFORMANT_OVERRIDE_ACTIVE[$i]}" == "1" ]] || continue
+
+        override=${INFORMANT_OVERRIDE_PATHS[$i]}
+        backup=${INFORMANT_OVERRIDE_BACKUPS[$i]}
+        existed=${INFORMANT_OVERRIDE_EXISTED[$i]}
+
+        if ! sudo -n rm -f -- "$override" >/dev/null 2>&1; then
+            failed=1
+            continue
+        fi
+
+        if [[ "$existed" == "1" ]]; then
+            if ! sudo -n cp -a -- "$backup" "$override" >/dev/null 2>&1; then
+                failed=1
+                continue
+            fi
+        fi
+
+        INFORMANT_OVERRIDE_ACTIVE[$i]=0
+        if [[ "$quiet" != "yes" ]]; then
+            ok "Restored Informant hook override: $override"
+        fi
+    done
+
+    return "$failed"
+}
+
+# Clean up resources on script exit
+cleanup() {
+    local exit_code=$?
+    local restore_failed=0
+
+    if (( CLEANUP_STARTED == 1 )); then
+        return
+    fi
+    CLEANUP_STARTED=1
+    trap - EXIT INT TERM HUP
+
+    # Restore Informant hooks
+    if ! restore_informant_hooks "yes"; then
+        restore_failed=1
+        printf '[FAIL] Emergency cleanup could not restore every Informant hook override.\n' >&2
+        printf '[FAIL] Inspect %s and preserve the temporary backups under %s.\n' \
+            "$INFORMANT_OVERRIDE_DIR" "${TEMP_DIR:-unknown}" >&2
+        if (( exit_code == 0 )); then
+            exit_code=1
+        fi
+    fi
+
+    # Kill sudo keepalive process
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
+
+    # Clean up temporary directory
+    if (( restore_failed == 0 )) && [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -n rm -rf -- "$TEMP_DIR" >/dev/null 2>&1 || rm -rf -- "$TEMP_DIR"
+        else
+            rm -rf -- "$TEMP_DIR"
+        fi
+    fi
+
+    exit "$exit_code"
+}
+
+# Install signal traps for clean cleanup
+install_traps() {
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+}
+
+# -----------------------------------------------------------------------------
+# Authorization functions
+# -----------------------------------------------------------------------------
+
+# Acquire sudo credentials and maintain them
+authorize_sudo() {
+    section "Authorisation"
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        blocking_error "dependency.sudo" "Required command is missing: sudo"
+        return 1
+    fi
+
+    info "Requesting initial sudo authentication."
+    if ! sudo -v; then
+        blocking_error "sudo.authentication" "Sudo authentication failed."
+        return 1
+    fi
+
+    # Spawn background process to keep sudo credentials alive
+    (
+        # Release the lock file descriptor to avoid holding it in child
+        exec {LOCK_FD}>&-
+        while true; do
+            sleep 50
+            sudo -n true >/dev/null 2>&1 || exit 0
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
+
+    ok "Sudo authentication acquired; credential keepalive started."
+}
+
+# -----------------------------------------------------------------------------
+# Audit and discovery functions
+# -----------------------------------------------------------------------------
+
+# Check for required and optional dependencies
+audit_dependencies() {
+    section "Dependencies"
+
+    local -a required=(
+        bash pacman sudo yay flock awk grep sed findmnt df getent systemctl
+    )
+    local -a optional=(
+        pacman-conf checkupdates paccache pacdiff flatpak informant snapper shellcheck
+    )
+    local command_name
+
+    # Check required commands
+    for command_name in "${required[@]}"; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            HAVE["$command_name"]=1
+        else
+            HAVE["$command_name"]=0
+            REQUIRED_MISSING=1
+            blocking_error "dependency.${command_name}" \
+                "Required command is missing: $command_name"
+        fi
+    done
+
+    # Check hostname commands
+    if command -v hostname >/dev/null 2>&1; then
+        HAVE["hostname"]=1
+    else
+        HAVE["hostname"]=0
+    fi
+    if command -v hostnamectl >/dev/null 2>&1; then
+        HAVE["hostnamectl"]=1
+    else
+        HAVE["hostnamectl"]=0
+    fi
+    if [[ "${HAVE[hostname]}" == "0" && "${HAVE[hostnamectl]}" == "0" ]]; then
+        REQUIRED_MISSING=1
+        blocking_error "dependency.hostname" \
+            "A required host-name command is missing: install hostname or provide hostnamectl."
+    fi
+
+    # Report optional commands
+    for command_name in "${optional[@]}"; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            HAVE["$command_name"]=1
+        else
+            HAVE["$command_name"]=0
+            info "Optional command unavailable: $command_name"
+        fi
+    done
+
+    if (( REQUIRED_MISSING == 0 )); then
+        ok "All required commands are available."
+    fi
+}
+
+# Check for pacman database lock
+check_pacman_lock() {
+    local context=${1:-audit}
+
+    if [[ -e "$PACMAN_LOCK" ]]; then
+        blocking_error "pacman.lock.${context}" \
+            "Pacman lock exists at $PACMAN_LOCK; it will not be deleted."
+        return 1
+    fi
+
+    ok "No pacman database lock is present."
+}
+
+# Load enabled repositories from pacman configuration
+load_enabled_repositories() {
+    local repo_file="$TEMP_DIR/enabled-repositories.txt"
+    local listing_file="$TEMP_DIR/repository-listing.txt"
+    local error_file="$TEMP_DIR/repository-listing.err"
+    local repo
+
+    : > "$repo_file"
+    : > "$listing_file"
+    : > "$error_file"
+
+    # Try pacman-conf first
+    if [[ "${HAVE[pacman-conf]:-0}" == "1" ]]; then
+        if pacman-conf --repo-list > "$repo_file" 2> "$TEMP_DIR/pacman-conf.err"; then
+            ok "Enabled repositories parsed with pacman-conf."
+        else
+            blocking_error "repo.parse" "pacman-conf could not parse enabled repositories."
+            indent_file "$TEMP_DIR/pacman-conf.err"
+            return 1
+        fi
+    else
+        warn "repo.parse.fallback" \
+            "pacman-conf is unavailable; repository names will be derived from pacman output."
+    fi
+
+    # Get repository database listing
+    if ! pacman -Sl > "$listing_file" 2> "$error_file"; then
+        blocking_error "repo.databases" "Enabled repository databases are not usable."
+        indent_file "$error_file"
+        return 1
+    fi
+
+    # Extract repository names
+    if [[ ! -s "$repo_file" ]]; then
+        awk 'NF && !seen[$1]++ {print $1}' "$listing_file" > "$repo_file"
+    fi
+
+    mapfile -t ENABLED_REPOS < <(awk 'NF {print $1}' "$repo_file")
+    if (( ${#ENABLED_REPOS[@]} == 0 )); then
+        blocking_error "repo.none" "No enabled repositories could be identified."
+        return 1
+    fi
+
+    info "Enabled repositories:"
+    for repo in "${ENABLED_REPOS[@]}"; do
+        printf '    %s\n' "$repo"
+    done
+    ok "Repository databases are readable."
+}
+
+# Check if a specific repository is enabled
+repository_is_enabled() {
+    local wanted=$1
+    local repo
+
+    for repo in "${ENABLED_REPOS[@]}"; do
+        if [[ "$repo" == "$wanted" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Check for CachyOS repository presence
+has_cachyos_repository() {
+    local repo
+
+    for repo in "${ENABLED_REPOS[@]}"; do
+        if [[ "$repo" == cachyos || "$repo" == cachyos-* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Verify critical packages are available from enabled repositories
+check_critical_packages() {
+    local -a critical=(bash pacman glibc systemd)
+    local package_name
+    local error_file
+
+    for package_name in "${critical[@]}"; do
+        error_file="$TEMP_DIR/pacman-si-${package_name}.err"
+        if pacman -Si -- "$package_name" >/dev/null 2> "$error_file"; then
+            ok "Critical package resolves through enabled repositories: $package_name"
+        else
+            blocking_error "repo.critical.${package_name}" \
+                "Critical package is unavailable from enabled repositories: $package_name"
+            indent_file "$error_file"
+        fi
+    done
+}
+
+# Record running kernel information and check for updates
+record_running_kernel() {
+    local owner_file="$TEMP_DIR/running-kernel-owner.txt"
+    local owner_error="$TEMP_DIR/running-kernel-owner.err"
+
+    RUNNING_KERNEL=$(uname -r)
+    RUNNING_MODULE_DIR="/usr/lib/modules/${RUNNING_KERNEL}"
+    : > "$owner_file"
+    : > "$owner_error"
+
+    info "Running kernel: $RUNNING_KERNEL"
+    info "Running kernel module directory: $RUNNING_MODULE_DIR"
+
+    # Find package owning the running kernel
+    if pacman -Qoq -- "$RUNNING_MODULE_DIR" > "$owner_file" 2> "$owner_error"; then
+        RUNNING_KERNEL_PACKAGE=$(awk 'NF {print; exit}' "$owner_file")
+    else
+        RUNNING_KERNEL_PACKAGE=""
+    fi
+
+    if [[ -z "$RUNNING_KERNEL_PACKAGE" ]]; then
+        if [[ "$RUNNING_KERNEL" == *cachyos* ]]; then
+            blocking_error "kernel.owner" \
+                "The running CachyOS kernel module directory has no installed package owner."
+        else
+            warn "kernel.owner" \
+                "The running kernel module directory has no installed package owner."
+        fi
+        indent_file "$owner_error"
+        return
+    fi
+
+    RUNNING_KERNEL_VERSION_BEFORE=$(
+        pacman -Q -- "$RUNNING_KERNEL_PACKAGE" 2>/dev/null |
+            awk 'NF >= 2 {print $2; exit}'
+    )
+
+    ok "Running kernel is owned by: $RUNNING_KERNEL_PACKAGE ${RUNNING_KERNEL_VERSION_BEFORE:-unknown}"
+
+    # Additional checks for CachyOS kernel
+    if [[ "$RUNNING_KERNEL" == *cachyos* ]]; then
+        if pacman -Si -- "$RUNNING_KERNEL_PACKAGE" >/dev/null 2> "$TEMP_DIR/kernel-repo.err"; then
+            ok "Running CachyOS kernel package resolves through enabled repositories."
+        else
+            blocking_error "kernel.repository" \
+                "Running CachyOS kernel package is unavailable from enabled repositories: $RUNNING_KERNEL_PACKAGE"
+            indent_file "$TEMP_DIR/kernel-repo.err"
+        fi
+    fi
+
+    # Check if kernel module directory exists
+    if [[ ! -d "$RUNNING_MODULE_DIR" ]]; then
+        REBOOT_REQUIRED="yes"
+        warn "kernel.modules.missing" \
+            "The running kernel module directory is absent; a reboot is required."
+    fi
+}
+
+# Verify CachyOS kernel packages are not foreign
+check_cachyos_kernel_classification() {
+    local installed_file="$TEMP_DIR/linux-cachyos-installed.txt"
+    local package_name
+    local foreign_found=0
+
+    pacman -Qq | awk '/^linux-cachyos/ {print}' > "$installed_file"
+    if [[ ! -s "$installed_file" ]]; then
+        info "No installed package name begins with linux-cachyos."
+        return
+    fi
+
+    while IFS= read -r package_name; do
+        [[ -n "$package_name" ]] || continue
+        if pacman -Qm -- "$package_name" >/dev/null 2>&1; then
+            foreign_found=1
+            blocking_error "kernel.foreign.${package_name}" \
+                "Installed CachyOS kernel package is classified as foreign: $package_name"
+        else
+            ok "CachyOS kernel package is repository-managed: $package_name"
+        fi
+    done < "$installed_file"
+
+    if (( foreign_found == 0 )); then
+        ok "No installed linux-cachyos package is classified as foreign."
+    fi
+}
+
+# Audit repository integrity and configuration
+audit_repository_integrity() {
+    section "Repository integrity"
+
+    if [[ ! -f "$PACMAN_CONF" || ! -r "$PACMAN_CONF" ]]; then
+        blocking_error "repo.pacman_conf" \
+            "$PACMAN_CONF does not exist as a readable regular file."
+        return
+    fi
+    ok "$PACMAN_CONF exists and is readable."
+
+    if ! load_enabled_repositories; then
+        return
+    fi
+
+    # Verify core repositories
+    if repository_is_enabled "core"; then
+        ok "Required repository is enabled: core"
+    else
+        blocking_error "repo.core" "Required repository is not enabled: core"
+    fi
+
+    if repository_is_enabled "extra"; then
+        ok "Required repository is enabled: extra"
+    else
+        blocking_error "repo.extra" "Required repository is not enabled: extra"
+    fi
+
+    if has_cachyos_repository; then
+        ok "At least one CachyOS repository is enabled."
+    else
+        blocking_error "repo.cachyos" "No CachyOS repository is enabled."
+    fi
+
+    check_critical_packages
+    record_running_kernel
+    check_cachyos_kernel_classification
+}
+
+# Audit pacman database integrity
+audit_package_database() {
+    section "Package database"
+
+    local output_file="$TEMP_DIR/pacman-dk.out"
+    local error_file="$TEMP_DIR/pacman-dk.err"
+
+    if pacman -Dk > "$output_file" 2> "$error_file"; then
+        ok "pacman -Dk completed successfully."
+        if [[ -s "$output_file" ]]; then
+            indent_file "$output_file"
+        fi
+    else
+        blocking_error "pacman.database" "pacman -Dk reported database errors."
+        indent_file "$output_file"
+        indent_file "$error_file"
+    fi
+}
+
+# Get available free space in MiB for a given path
+available_mib() {
+    local path=$1
+    df -Pm -- "$path" 2>/dev/null | awk 'NR == 2 {print $4}'
+}
+
+# Audit network connectivity and storage availability
+audit_network_and_storage() {
+    section "Network and storage"
+
+    local dns_file="$TEMP_DIR/dns.txt"
+    local root_free=""
+    local boot_target=""
+    local boot_free=""
+    local path
+
+    # Check DNS resolution
+    if getent ahosts archlinux.org > "$dns_file" 2> "$TEMP_DIR/dns.err" &&
+        [[ -s "$dns_file" ]]; then
+        ok "System resolver can resolve archlinux.org."
+    else
+        blocking_error "network.dns" \
+            "The system resolver could not resolve archlinux.org."
+        indent_file "$TEMP_DIR/dns.err"
+    fi
+
+    # Check root filesystem space
+    root_free=$(available_mib "/")
+    if [[ "$root_free" =~ ^[0-9]+$ ]]; then
+        info "Free space on /: ${root_free} MiB"
+        if (( root_free < ROOT_BLOCK_MIB )); then
+            blocking_error "storage.root" \
+                "Free space on / is below the ${ROOT_BLOCK_MIB} MiB blocking threshold."
+        else
+            ok "Root filesystem free space meets the blocking threshold."
+        fi
+    else
+        blocking_error "storage.root.read" "Unable to determine free space on /."
+    fi
+
+    # Check /boot if it's a separate mount
+    boot_target=$(findmnt -n -o TARGET --target /boot 2>/dev/null || true)
+    if [[ "$boot_target" == "/boot" ]]; then
+        boot_free=$(available_mib "/boot")
+        if [[ "$boot_free" =~ ^[0-9]+$ ]]; then
+            info "Free space on separately mounted /boot: ${boot_free} MiB"
+            if (( boot_free < BOOT_BLOCK_MIB )); then
+                blocking_error "storage.boot.block" \
+                    "Free space on /boot is below the ${BOOT_BLOCK_MIB} MiB blocking threshold."
+            elif (( boot_free < BOOT_WARN_MIB )); then
+                warn "storage.boot.warn" \
+                    "Free space on /boot is below the ${BOOT_WARN_MIB} MiB warning threshold."
+            else
+                ok "Separate /boot free space meets the warning threshold."
+            fi
+        else
+            blocking_error "storage.boot.read" \
+                "Unable to determine free space on separately mounted /boot."
+        fi
+    else
+        info "/boot is not a separate mount; no separate /boot threshold applies."
+    fi
+
+    # Check write access for critical paths
+    for path in "$PACMAN_DB_DIR" "$PACMAN_CACHE_DIR" "/etc"; do
+        if [[ ! -e "$path" ]]; then
+            blocking_error "storage.path.${path//\//_}" "Required path is absent: $path"
+        elif sudo -n test -w "$path"; then
+            ok "Root has write access to: $path"
+        else
+            blocking_error "storage.write.${path//\//_}" \
+                "Root does not have write access to: $path"
+        fi
+    done
+
+    if sudo -n test -w "$PACMAN_CONF"; then
+        ok "Root has write access to $PACMAN_CONF."
+    else
+        warn "storage.pacman_conf.write" \
+            "Root cannot write $PACMAN_CONF; package updates may still work, but configuration maintenance will not."
+    fi
+}
+
+# Check Snapper configuration if available
+audit_snapper() {
+    section "Snapper"
+
+    if [[ "${HAVE[snapper]:-0}" != "1" ]]; then
+        info "Snapper is not installed; snapshot checks are skipped."
+        return
+    fi
+
+    if sudo -n snapper -c root get-config > "$TEMP_DIR/snapper-root.out" \
+        2> "$TEMP_DIR/snapper-root.err"; then
+        ok "Snapper root configuration exists."
+    else
+        warn "snapper.root" \
+            "Snapper is installed, but a usable root configuration was not found."
+        indent_file "$TEMP_DIR/snapper-root.err"
+    fi
+}
+
+# Determine if a configuration file is high priority
+is_high_priority_config() {
+    local base=$1
+
+    case "$base" in
+        /etc/pacman.conf|\
+        /etc/makepkg.conf|\
+        /etc/mkinitcpio.conf|\
+        /etc/fstab|\
+        /etc/crypttab|\
+        /etc/default/grub|\
+        /etc/limine-entry-tool.conf|\
+        /etc/sudoers|\
+        /etc/passwd|\
+        /etc/group|\
+        /etc/shadow|\
+        /etc/gshadow|\
+        /etc/nsswitch.conf|\
+        /etc/locale.conf|\
+        /etc/locale.gen|\
+        /etc/hostname|\
+        /etc/hosts|\
+        /etc/resolv.conf|\
+        /etc/ssh/sshd_config)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Scan for pending pacnew/pacsave/pacorig files
+scan_config_files() {
+    local report=${1:-yes}
+    local found_file="$TEMP_DIR/config-files.txt"
+    local scan_error="$TEMP_DIR/config-files.err"
+    local path
+    local base
+    local pacdiff_rc=0
+    declare -A seen=()
+
+    CONFIG_HIGH_FILES=()
+    CONFIG_NORMAL_FILES=()
+    : > "$found_file"
+    : > "$scan_error"
+
+    # Use pacdiff if available
+    if [[ "${HAVE[pacdiff]:-0}" == "1" ]]; then
+        pacdiff -o > "$found_file" 2> "$scan_error" || pacdiff_rc=$?
+        if (( pacdiff_rc != 0 )); then
+            warn "config.pacdiff" \
+                "pacdiff -o failed; falling back to a read-only search under /etc."
+            : > "$found_file"
+            sudo -n find /etc -xdev -type f \
+                \( -name '*.pacnew' -o -name '*.pacsave' -o -name '*.pacorig' \) \
+                -print > "$found_file" 2>> "$scan_error" || true
+        fi
+    else
+        sudo -n find /etc -xdev -type f \
+            \( -name '*.pacnew' -o -name '*.pacsave' -o -name '*.pacorig' \) \
+            -print > "$found_file" 2> "$scan_error" || true
+    fi
+
+    # Process found files
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if [[ "$path" != /* ]]; then
+            path="/${path}"
+        fi
+        [[ -z "${seen[$path]+x}" ]] || continue
+        seen["$path"]=1
+
+        base=$path
+        base=${base%.pacnew}
+        base=${base%.pacsave}
+        base=${base%.pacorig}
+
+        if is_high_priority_config "$base"; then
+            CONFIG_HIGH_FILES+=("$path")
+        else
+            CONFIG_NORMAL_FILES+=("$path")
+        fi
+    done < "$found_file"
+
+    CONFIG_HIGH_COUNT=${#CONFIG_HIGH_FILES[@]}
+    CONFIG_TOTAL_COUNT=$(( CONFIG_HIGH_COUNT + ${#CONFIG_NORMAL_FILES[@]} ))
+
+    # Report findings
+    if (( CONFIG_TOTAL_COUNT == 0 )); then
+        ok "No pacnew, pacsave, or pacorig files were found."
+    else
+        warn "config.pending" \
+            "$CONFIG_TOTAL_COUNT package configuration file(s) require manual review."
+        if (( CONFIG_HIGH_COUNT > 0 )); then
+            warn "config.high_priority" \
+                "$CONFIG_HIGH_COUNT high-priority package configuration file(s) require manual review."
+        fi
+        if [[ -n "${seen[/etc/pacman.conf.pacnew]+x}" ]]; then
+            warn "config.pacman_conf.pacnew" \
+                "/etc/pacman.conf.pacnew is pending; active repository checks determine whether the current configuration is usable."
+        fi
+    fi
+
+    # Print detailed list if requested and files exist
+    if [[ "$report" == "yes" && $CONFIG_TOTAL_COUNT -gt 0 ]]; then
+        if (( CONFIG_HIGH_COUNT > 0 )); then
+            info "High-priority configuration files:"
+            printf '    %s\n' "${CONFIG_HIGH_FILES[@]}"
+        fi
+        if (( ${#CONFIG_NORMAL_FILES[@]} > 0 )); then
+            info "Normal-priority configuration files:"
+            printf '    %s\n' "${CONFIG_NORMAL_FILES[@]}"
+        fi
+    fi
+
+    if [[ -s "$scan_error" ]]; then
+        info "Configuration scan diagnostics:"
+        indent_file "$scan_error"
+    fi
+}
+
+# Audit configuration files
+audit_config_files() {
+    section "Configuration files"
+    scan_config_files "yes"
+}
+
+# Scan for failed systemd units
+scan_failed_units() {
+    local report=${1:-yes}
+    local failed_file="$TEMP_DIR/failed-units.txt"
+    local failed_error="$TEMP_DIR/failed-units.err"
+    local unit
+    local unit_state
+    local load_state
+
+    RELEVANT_FAILED_UNITS=()
+    IGNORED_FAILED_UNITS=()
+    : > "$failed_file"
+    : > "$failed_error"
+
+    # Query failed units
+    if ! systemctl list-units --state=failed --all --no-legend --plain \
+        > "$failed_file" 2> "$failed_error"; then
+        warn "systemd.query" "Unable to query failed systemd units."
+        indent_file "$failed_error"
+        RELEVANT_FAILED_COUNT=0
+        IGNORED_FAILED_COUNT=0
+        return
+    fi
+
+    # Classify each failed unit
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+
+        unit_state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+        unit_state=${unit_state%%$'\n'*}
+        load_state=$(systemctl show "$unit" -p LoadState --value 2>/dev/null || true)
+
+        case "$unit_state" in
+            disabled|masked|masked-runtime)
+                IGNORED_FAILED_UNITS+=("$unit [$unit_state]")
+                ;;
+            *)
+                if [[ "$load_state" == "not-found" ]]; then
+                    IGNORED_FAILED_UNITS+=("$unit [not-found]")
+                else
+                    RELEVANT_FAILED_UNITS+=("$unit [${unit_state:-unknown}]")
+                fi
+                ;;
+        esac
+    done < <(
+        awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /\.(service|socket|target|device|mount|automount|swap|timer|path|slice|scope|busname)$/) {
+                        print $i
+                        break
+                    }
+                }
+            }
+        ' "$failed_file"
+    )
+
+    RELEVANT_FAILED_COUNT=${#RELEVANT_FAILED_UNITS[@]}
+    IGNORED_FAILED_COUNT=${#IGNORED_FAILED_UNITS[@]}
+
+    if (( RELEVANT_FAILED_COUNT > 0 )); then
+        warn "systemd.failed.relevant" \
+            "$RELEVANT_FAILED_COUNT operationally relevant systemd unit(s) are failed."
+    else
+        ok "No operationally relevant failed systemd units were found."
+    fi
+
+    if (( IGNORED_FAILED_COUNT > 0 )); then
+        info "$IGNORED_FAILED_COUNT disabled, masked, or stale failed unit(s) were ignored."
+    else
+        info "No disabled, masked, or stale failed unit remnants were found."
+    fi
+
+    if [[ "$report" == "yes" ]]; then
+        if (( RELEVANT_FAILED_COUNT > 0 )); then
+            info "Relevant failed units:"
+            printf '    %s\n' "${RELEVANT_FAILED_UNITS[@]}"
+        fi
+        if (( IGNORED_FAILED_COUNT > 0 )); then
+            info "Ignored failed units:"
+            printf '    %s\n' "${IGNORED_FAILED_UNITS[@]}"
+        fi
+    fi
+}
+
+# Audit system services
+audit_system_services() {
+    section "System services"
+    scan_failed_units "yes"
+}
+
+# Run the complete read-only audit
+run_full_audit() {
+    audit_dependencies
+    if (( REQUIRED_MISSING != 0 )); then
+        return
+    fi
+
+    check_pacman_lock "audit"
+    audit_repository_integrity
+    audit_package_database
+    audit_network_and_storage
+    audit_snapper
+    audit_config_files
+    audit_system_services
+}
+
+# -----------------------------------------------------------------------------
+# Update discovery functions
+# -----------------------------------------------------------------------------
+
+# Check for unread Arch Linux news using Informant
+check_arch_news() {
+    section "Arch Linux news"
+
+    local news_file="$TEMP_DIR/informant-unread.txt"
+    local news_error="$TEMP_DIR/informant-unread.err"
+    local rc=0
+    local count=0
+
+    if [[ "${HAVE[informant]:-0}" != "1" ]]; then
+        UNREAD_NEWS_COUNT="unavailable"
+        info "Informant is not installed; Arch news integration is unavailable."
+        return
+    fi
+
+    : > "$news_file"
+    : > "$news_error"
+
+    sudo -n informant list --unread > "$news_file" 2> "$news_error" || rc=$?
+    if (( rc != 0 )); then
+        warn "informant.check" \
+            "Informant could not check unread Arch Linux news; package updates are not blocked by this check alone."
+        indent_file "$news_error"
+        UNREAD_NEWS_COUNT="unavailable"
+        return
+    fi
+
+    count=$(awk 'NF {count++} END {print count+0}' "$news_file")
+    UNREAD_NEWS_COUNT=$count
+    NEWS_CHECK_OK=1
+
+    if (( count == 0 )); then
+        ok "No unread Arch Linux news items were reported by Informant."
+    else
+        warn "informant.unread" "$count unread Arch Linux news item(s) were reported."
+        indent_file "$news_file"
+    fi
+}
+
+# Find Informant's pacman hooks
+find_informant_hooks() {
+    local hook
+    local file
+
+    pacman -Qlq informant 2>/dev/null |
+        while IFS= read -r file; do
+            [[ "$file" == /usr/share/libalpm/hooks/*.hook ]] || continue
+            if grep -Eq '(^|[[:space:]])Exec[[:space:]]*=.*(/|[[:space:]])informant([[:space:]]|$)' "$file" 2>/dev/null; then
+                printf '%s\n' "$file"
+            fi
+        done
+}
+
+# Temporarily disable Informant hooks to allow unattended updates
+mask_informant_hooks() {
+    local -a hooks=()
+    local hook
+    local base
+    local override
+    local backup
+    local existed
+    local target
+
+    [[ "$MODE" == "update" ]] || return 0
+    [[ "$UNREAD_NEWS_COUNT" =~ ^[0-9]+$ ]] || return 0
+    (( UNREAD_NEWS_COUNT > 0 )) || return 0
+
+    mapfile -t hooks < <(find_informant_hooks)
+    if (( ${#hooks[@]} == 0 )); then
+        warn "informant.hook.not_found" \
+            "Informant is installed, but its package-owned pacman hook could not be identified."
+        return 1
+    fi
+
+    if ! sudo -n install -d -m 755 -- "$INFORMANT_OVERRIDE_DIR"; then
+        warn "informant.hook.directory" \
+            "Unable to prepare the pacman hook override directory."
+        return 1
+    fi
+
+    for hook in "${hooks[@]}"; do
+        base=${hook##*/}
+        override="${INFORMANT_OVERRIDE_DIR}/${base}"
+        backup="${TEMP_DIR}/${base}.override-backup"
+        existed=0
+
+        # Skip if already disabled
+        if [[ -L "$override" ]]; then
+            target=$(readlink -- "$override" 2>/dev/null || true)
+            if [[ "$target" == "/dev/null" ]]; then
+                info "Informant hook is already disabled by an existing override: $override"
+                continue
+            fi
+        fi
+
+        # Backup existing override
+        if sudo -n test -e "$override" || sudo -n test -L "$override"; then
+            if ! sudo -n cp -a -- "$override" "$backup"; then
+                warn "informant.hook.backup.${base}" \
+                    "Unable to back up existing Informant hook override: $override"
+                continue
+            fi
+            existed=1
+        fi
+
+        # Disable hook
+        if ! sudo -n rm -f -- "$override" ||
+            ! sudo -n ln -s /dev/null "$override"; then
+            warn "informant.hook.mask.${base}" \
+                "Unable to temporarily disable Informant hook: $override"
+            if [[ "$existed" == "1" ]]; then
+                sudo -n cp -a -- "$backup" "$override" >/dev/null 2>&1 || true
+            fi
+            continue
+        fi
+
+        # Track disabled hook for later restoration
+        INFORMANT_OVERRIDE_PATHS+=("$override")
+        INFORMANT_OVERRIDE_BACKUPS+=("$backup")
+        INFORMANT_OVERRIDE_EXISTED+=("$existed")
+        INFORMANT_OVERRIDE_ACTIVE+=("1")
+        ok "Temporarily disabled package-owned Informant hook: $hook"
+    done
+}
+
+# Discover repository updates using checkupdates
+discover_repository_updates() {
+    local output_file="$TEMP_DIR/repository-updates.txt"
+    local error_file="$TEMP_DIR/repository-updates.err"
+    local rc=0
+
+    : > "$output_file"
+    : > "$error_file"
+
+    if [[ "${HAVE[checkupdates]:-0}" != "1" ]]; then
+        REPO_UPDATES_COUNT="unavailable"
+        warn "discovery.repository.unavailable" \
+            "checkupdates is unavailable; repository update discovery is disabled. pacman-contrib provides it."
+        return
+    fi
+
+    # Use isolated database to avoid interfering with package manager
+    CHECKUPDATES_DB="$TEMP_DIR/checkupdates-db" TMPDIR="$TEMP_DIR" \
+        checkupdates --nocolor > "$output_file" 2> "$error_file" || rc=$?
+
+    case "$rc" in
+        0)
+            REPO_UPDATES_COUNT=$(count_nonempty_lines "$output_file")
+            REPO_DISCOVERY_OK=1
+            ;;
+        2)
+            REPO_UPDATES_COUNT=0
+            REPO_DISCOVERY_OK=1
+            ;;
+        *)
+            REPO_UPDATES_COUNT="unavailable"
+            error "discovery.repository.failed" \
+                "Repository update discovery failed."
+            indent_file "$error_file"
+            ;;
+    esac
+
+    if (( REPO_DISCOVERY_OK == 1 )); then
+        info "Repository updates available: $REPO_UPDATES_COUNT"
+    fi
+}
+
+# Discover AUR updates using yay
+discover_aur_updates() {
+    local output_file="$TEMP_DIR/aur-updates.txt"
+    local error_file="$TEMP_DIR/aur-updates.err"
+    local -a devel_args=()
+    local rc=0
+
+    : > "$output_file"
+    : > "$error_file"
+
+    if [[ "$AUR_CHECK_DEVEL" == "true" ]]; then
+        devel_args=(--devel)
+    else
+        devel_args=(--devel=false)
+    fi
+
+    yay -Qua "${devel_args[@]}" >"$output_file" 2>"$error_file"
+    rc=$?
+
+    # yay returns 0 when updates are available, 1 when no updates
+    if (( rc == 0 )); then
+        AUR_UPDATES_COUNT=$(count_nonempty_lines "$output_file")
+        AUR_DISCOVERY_OK=1
+        info "AUR updates available: $AUR_UPDATES_COUNT"
+    elif (( rc == 1 )) && [[ ! -s "$output_file" ]] && [[ ! -s "$error_file" ]]; then
+        AUR_UPDATES_COUNT=0
+        AUR_DISCOVERY_OK=1
+        info "AUR updates available: 0"
+    else
+        AUR_UPDATES_COUNT="unavailable"
+        error "discovery.aur.failed" \
+            "AUR update discovery failed (exit status $rc)."
+        [[ -s "$error_file" ]] && indent_file "$error_file"
+    fi
+}
+
+# Check if Flatpak scope has any installed refs
+flatpak_scope_has_refs() {
+    local scope=$1
+    local output_file=$2
+
+    : > "$output_file"
+    if flatpak list "$scope" --columns=application > "$output_file" \
+        2> "${output_file}.err"; then
+        [[ -s "$output_file" ]]
+        return
+    fi
+    return 2
+}
+
+# Discover Flatpak updates for a specific scope
+discover_flatpak_scope() {
+    local scope=$1
+    local label=$2
+    local output_file=$3
+    local has_refs_var=$4
+    local count_var=$5
+    local ok_var=$6
+    local refs_file="${output_file}.refs"
+    local rc=0
+    local count=0
+
+    : > "$output_file"
+
+    if flatpak_scope_has_refs "$scope" "$refs_file"; then
+        printf -v "$has_refs_var" '%s' "1"
+    else
+        rc=$?
+        if (( rc == 1 )); then
+            printf -v "$has_refs_var" '%s' "0"
+            printf -v "$count_var" '%s' "0"
+            printf -v "$ok_var" '%s' "1"
+            info "No $label Flatpak refs are installed."
+            return
+        fi
+
+        printf -v "$count_var" '%s' "unavailable"
+        warn "flatpak.${label}.list" "Unable to inspect $label Flatpak refs."
+        indent_file "${refs_file}.err"
+        return
+    fi
+
+    if flatpak remote-ls --updates "$scope" --columns=application,name \
+        > "$output_file" 2> "${output_file}.err"; then
+        count=$(count_nonempty_lines "$output_file")
+        printf -v "$count_var" '%s' "$count"
+        printf -v "$ok_var" '%s' "1"
+        info "$label Flatpak updates available: $count"
+    else
+        printf -v "$count_var" '%s' "unavailable"
+        warn "flatpak.${label}.discovery" \
+            "Unable to discover $label Flatpak updates."
+        indent_file "${output_file}.err"
+    fi
+}
+
+# Discover all available updates
+discover_updates() {
+    section "Update discovery"
+
+    discover_repository_updates
+    discover_aur_updates
+    discover_flatpak_updates
+}
+
+# -----------------------------------------------------------------------------
+# Display helper functions
+# -----------------------------------------------------------------------------
+
+# Print package names from a file
+print_package_names() {
+    local file=$1
+
+    if [[ ! -s "$file" ]]; then
+        printf '    None\n'
+        return
+    fi
+    awk 'NF {print "    " $1}' "$file"
+}
+
+# Print Flatpak application names from a file
+print_flatpak_names() {
+    local file=$1
+
+    if [[ ! -s "$file" ]]; then
+        printf '    None\n'
+        return
+    fi
+    sed 's/^/    /' "$file"
+}
+
+# Print the update plan
+print_update_plan() {
+    section "Update plan"
+
+    info "Official repository packages:"
+    if (( REPO_DISCOVERY_OK == 1 )); then
+        print_package_names "$TEMP_DIR/repository-updates.txt"
+    else
+        printf '    Discovery unavailable\n'
+    fi
+
+    info "AUR packages:"
+    if (( AUR_DISCOVERY_OK == 1 )); then
+        print_package_names "$TEMP_DIR/aur-updates.txt"
+    else
+        printf '    Discovery unavailable\n'
+    fi
+
+    info "System Flatpaks:"
+    if (( FLATPAK_SYSTEM_DISCOVERY_OK == 1 )); then
+        print_flatpak_names "$TEMP_DIR/flatpak-system-updates.txt"
+    else
+        printf '    Discovery unavailable\n'
+    fi
+
+    info "User Flatpaks:"
+    if (( FLATPAK_USER_DISCOVERY_OK == 1 )); then
+        print_flatpak_names "$TEMP_DIR/flatpak-user-updates.txt"
+    else
+        printf '    Discovery unavailable\n'
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Transaction execution functions
+# -----------------------------------------------------------------------------
+
+# Run official repository update
+run_official_update() {
+    section "Official repository update"
+
+    if ! check_pacman_lock "repository-transaction"; then
+        REPO_TRANSACTION_STATUS="blocked by pacman lock"
+        return 1
+    fi
+
+    info "Running official repository transaction with pacman."
+    if sudo pacman -Syu --noconfirm; then
+        REPO_TRANSACTION_STATUS="completed"
+        ok "Repository transaction completed."
+        return 0
+    fi
+
+    REPO_TRANSACTION_STATUS="failed"
+    error "transaction.repository" \
+        "Repository transaction failed; the AUR transaction and pacman maintenance will be skipped."
+    return 1
+}
+
+# Run AUR update
+run_aur_update() {
+    section "AUR update"
+
+    local -a devel_args=()
+    local -a yay_args=(
+        -Sua
+        --noconfirm
+        --answerclean None
+        --answerdiff None
+        --answeredit None
+        --answerupgrade All
+    )
+    local rc=0
+
+    if [[ "$AUR_CHECK_DEVEL" == "true" ]]; then
+        devel_args=(--devel)
+    else
+        devel_args=(--devel=false)
+    fi
+
+    if (( AUR_DISCOVERY_OK != 1 )); then
+        AUR_TRANSACTION_STATUS="skipped; discovery failed"
+        warn "transaction.aur.discovery" \
+            "AUR update was skipped because AUR discovery did not complete."
+        return
+    fi
+
+    if [[ "$AUR_UPDATES_COUNT" == "0" ]]; then
+        AUR_TRANSACTION_STATUS="not needed"
+        info "No AUR updates were detected."
+        return
+    fi
+
+    if ! check_pacman_lock "aur-transaction"; then
+        AUR_TRANSACTION_STATUS="blocked by pacman lock"
+        return
+    fi
+
+    info "Running AUR-only transaction with Yay."
+
+    if yay "${yay_args[@]}" "${devel_args[@]}"; then
+        AUR_TRANSACTION_STATUS="completed"
+        ok "AUR transaction completed."
+    else
+        rc=$?
+        AUR_TRANSACTION_STATUS="failed"
+        error "transaction.aur" \
+            "AUR transaction failed or required intervention (exit status $rc)."
+    fi
+}
+
+# Update Flatpak scope (system or user)
+update_flatpak_scope() {
+    local scope=$1
+    local label=$2
+    local has_refs=$3
+    local status_var=$4
+
+    if (( has_refs == 0 )); then
+        printf -v "$status_var" '%s' "not applicable; no refs"
+        info "No $label Flatpak refs are installed."
+        return
+    fi
+
+    info "Updating $label Flatpaks."
+    if flatpak update "$scope" --noninteractive -y; then
+        printf -v "$status_var" '%s' "completed"
+        ok "$label Flatpak update completed."
+
+        # Remove unused runtimes
+        if flatpak uninstall "$scope" --unused --noninteractive -y; then
+            ok "Unused $label Flatpak runtimes were processed."
+        else
+            warn "flatpak.${label}.unused" \
+                "Unused $label Flatpak runtime removal failed."
+        fi
+    else
+        printf -v "$status_var" '%s' "failed"
+        error "transaction.flatpak.${label}" "$label Flatpak update failed."
+    fi
+}
+
+# Run all Flatpak updates
+run_flatpak_updates() {
+    section "Flatpak"
+
+    if [[ "${HAVE[flatpak]:-0}" != "1" ]]; then
+        FLATPAK_SYSTEM_TRANSACTION_STATUS="unavailable"
+        FLATPAK_USER_TRANSACTION_STATUS="unavailable"
+        info "Flatpak is not installed; Flatpak maintenance is skipped."
+        return
+    fi
+
+    update_flatpak_scope "--system" "system" "$FLATPAK_SYSTEM_HAS_REFS" \
+        FLATPAK_SYSTEM_TRANSACTION_STATUS
+    update_flatpak_scope "--user" "user" "$FLATPAK_USER_HAS_REFS" \
+        FLATPAK_USER_TRANSACTION_STATUS
+}
+
+# -----------------------------------------------------------------------------
+# Interactive helper functions
+# -----------------------------------------------------------------------------
+
+# Prompt for yes/no answer
+ask_yes_no() {
+    local prompt=$1
+    local answer=""
+
+    printf '%s' "$prompt"
+    if ! IFS= read -r answer; then
+        printf '\n'
+        return 1
+    fi
+
+    case "$answer" in
+        y|Y|yes|YES|Yes)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+# Cleanup and maintenance functions
+# -----------------------------------------------------------------------------
+
+# Read orphan packages from pacman
+read_orphans() {
+    local output_file=$1
+    local error_file=$2
+    local rc
+
+    : >"$output_file"
+    : >"$error_file"
+
+    pacman -Qdtq >"$output_file" 2>"$error_file"
+    rc=$?
+
+    case "$rc" in
+        0)
+            # One or more orphaned packages found.
+            return 0
+            ;;
+        1)
+            # No orphaned packages. This is a normal condition.
+            if [[ ! -s "$output_file" && ! -s "$error_file" ]]; then
+                return 0
+            fi
+            # Exit 1 with stderr means a genuine query failure.
+            return 1
+            ;;
+        *)
+            return "$rc"
+            ;;
+    esac
+}
+
+# Handle orphan package removal interactively
+handle_orphans() {
+    section "Orphans"
+
+    local output_file="$TEMP_DIR/orphans.txt"
+    local error_file="$TEMP_DIR/orphans.err"
+    local -a orphans=()
+    local current_count=0
+    local prior_signature=""
+    local signature=""
+
+    while true; do
+        if ! read_orphans "$output_file" "$error_file"; then
+            error "orphans.query" "Unable to query orphaned packages."
+            indent_file "$error_file"
+            return
+        fi
+
+        mapfile -t orphans < <(awk 'NF {print $1}' "$output_file")
+        current_count=${#orphans[@]}
+
+        if (( current_count == 0 )); then
+            if (( ORPHANS_FOUND == 0 )); then
+                ok "No orphaned packages were found."
+            else
+                ok "No orphaned packages remain."
+            fi
+            return
+        fi
+
+        if (( ORPHANS_FOUND == 0 )); then
+            ORPHANS_FOUND=$current_count
+        fi
+
+        info "Orphaned packages:"
+        printf '    %s\n' "${orphans[@]}"
+        info "Build dependencies can legitimately appear in this list."
+
+        if ! ask_yes_no "Remove these orphaned packages? [y/N] "; then
+            ORPHAN_REMOVAL_DECLINED="yes"
+            info "Orphaned packages were left installed."
+            return
+        fi
+
+        if ! check_pacman_lock "orphan-removal"; then
+            return
+        fi
+
+        if sudo pacman -Rns --noconfirm -- "${orphans[@]}"; then
+            ORPHANS_REMOVED=$(( ORPHANS_REMOVED + current_count ))
+            ok "Removed $current_count orphaned package(s)."
+        else
+            error "orphans.remove" "Orphan removal failed."
+            return
+        fi
+
+        # Break if we're making no progress (prevent infinite loops)
+        signature=$(printf '%s\n' "${orphans[@]}")
+        if [[ "$signature" == "$prior_signature" ]]; then
+            error "orphans.no_progress" \
+                "Orphan removal made no observable progress; stopping the loop."
+            return
+        fi
+        prior_signature=$signature
+    done
+}
+
+# Clean pacman package cache
+clean_pacman_cache() {
+    section "Package cache"
+
+    if [[ "${HAVE[paccache]:-0}" != "1" ]]; then
+        warn "cache.paccache.missing" \
+            "paccache is unavailable; pacman-contrib provides it. No cache fallback will be used."
+        return
+    fi
+
+    # Keep newest 3 versions of installed packages
+    if sudo paccache -r -k 3; then
+        ok "Kept the newest three cached versions of installed packages."
+    else
+        warn "cache.installed" \
+            "Cleaning old cached versions of installed packages failed."
+    fi
+
+    # Remove cached packages that are no longer installed
+    if sudo paccache -ruk0; then
+        ok "Removed cached packages that are no longer installed."
+    else
+        warn "cache.uninstalled" \
+            "Cleaning cached packages that are no longer installed failed."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Post-update health checks
+# -----------------------------------------------------------------------------
+
+# Check if reboot is required after updates
+check_restart_requirement() {
+    section "Restart check"
+
+    if [[ -n "$RUNNING_KERNEL_PACKAGE" ]]; then
+        RUNNING_KERNEL_VERSION_AFTER=$(
+            pacman -Q -- "$RUNNING_KERNEL_PACKAGE" 2>/dev/null |
+                awk 'NF >= 2 {print $2; exit}'
+        )
+
+        if [[ -z "$RUNNING_KERNEL_VERSION_AFTER" ]]; then
+            REBOOT_REQUIRED="yes"
+            warn "kernel.package.removed" \
+                "The package that owns the running kernel is no longer installed."
+        elif [[ "$RUNNING_KERNEL_VERSION_AFTER" != "$RUNNING_KERNEL_VERSION_BEFORE" ]]; then
+            REBOOT_REQUIRED="yes"
+            warn "kernel.package.changed" \
+                "The running kernel package changed from ${RUNNING_KERNEL_VERSION_BEFORE:-unknown} to $RUNNING_KERNEL_VERSION_AFTER."
+        fi
+    fi
+
+    if [[ -n "$RUNNING_MODULE_DIR" && ! -d "$RUNNING_MODULE_DIR" ]]; then
+        REBOOT_REQUIRED="yes"
+        warn "kernel.modules.missing" \
+            "The module directory for the running kernel is absent."
+    fi
+
+    if [[ "$REBOOT_REQUIRED" == "yes" ]]; then
+        warn "reboot.required" "A reboot is required; no reboot will be performed."
+    else
+        ok "No kernel-based reboot requirement was detected."
+    fi
+}
+
+# Rescan health after updates
+rescan_post_update_health() {
+    section "Post-update health rescan"
+    scan_config_files "yes"
+    scan_failed_units "yes"
+}
+
+# Prompt to read Arch Linux news
+prompt_read_news() {
+    [[ "$MODE" == "update" ]] || return
+    (( NEWS_CHECK_OK == 1 )) || return
+    [[ "$UNREAD_NEWS_COUNT" =~ ^[0-9]+$ ]] || return
+    (( UNREAD_NEWS_COUNT > 0 )) || return
+
+    section "Arch Linux news choice"
+
+    if ask_yes_no "Read $UNREAD_NEWS_COUNT unread Arch Linux news item(s) now? [y/N] "; then
+        if sudo informant read; then
+            ok "Informant news reading completed."
+            # Check how many remain unread
+            if sudo -n informant list --unread > "$TEMP_DIR/informant-unread-after.txt" \
+                2> "$TEMP_DIR/informant-unread-after.err"; then
+                UNREAD_NEWS_COUNT=$(
+                    count_nonempty_lines "$TEMP_DIR/informant-unread-after.txt"
+                )
+            fi
+        else
+            error "informant.read" "Informant could not complete news reading."
+        fi
+    else
+        NEWS_READ_DECLINED="yes"
+        info "Unread Arch Linux news items were left unread."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Summary and exit functions
+# -----------------------------------------------------------------------------
+
+# Format a summary value
+summary_value() {
+    printf '%-42s %s\n' "$1:" "$2"
+}
+
+# Print collected messages
+print_messages() {
+    local heading=$1
+    shift
+    local -a messages=("$@")
+    local message
+
+    (( ${#messages[@]} > 0 )) || return
+    printf '\n%s:\n' "$heading"
+    for message in "${messages[@]}"; do
+        printf '    - %s\n' "$message"
+    done
+}
+
+# Print the final summary
+print_summary() {
+    local end_epoch
+    local duration
+    local warning_count=${#WARNING_MESSAGES[@]}
+    local error_count=${#ERROR_MESSAGES[@]}
+
+    end_epoch=$(date +%s)
+    duration=$(( end_epoch - START_EPOCH ))
+
+    section "Summary"
+
+    if [[ "$MODE" == "update" ]]; then
+        summary_value "Repository transaction" "$REPO_TRANSACTION_STATUS"
+        summary_value "Repository updates initially detected" "$REPO_UPDATES_COUNT"
+        summary_value "AUR transaction" "$AUR_TRANSACTION_STATUS"
+        summary_value "AUR updates initially detected" "$AUR_UPDATES_COUNT"
+        summary_value "System Flatpak transaction" "$FLATPAK_SYSTEM_TRANSACTION_STATUS"
+        summary_value "User Flatpak transaction" "$FLATPAK_USER_TRANSACTION_STATUS"
+        summary_value "Orphans found" "$ORPHANS_FOUND"
+        summary_value "Orphans removed" "$ORPHANS_REMOVED"
+        summary_value "Orphan removal declined" "$ORPHAN_REMOVAL_DECLINED"
+        summary_value "Configuration files pending" "$CONFIG_TOTAL_COUNT"
+        summary_value "High-priority configuration files" "$CONFIG_HIGH_COUNT"
+        summary_value "Relevant failed units" "$RELEVANT_FAILED_COUNT"
+        summary_value "Ignored failed units" "$IGNORED_FAILED_COUNT"
+        summary_value "Unread Arch news" "$UNREAD_NEWS_COUNT"
+        summary_value "News reading declined" "$NEWS_READ_DECLINED"
+        summary_value "Reboot required" "$REBOOT_REQUIRED"
+    else
+        summary_value "Repository updates available" "$REPO_UPDATES_COUNT"
+        summary_value "AUR updates available" "$AUR_UPDATES_COUNT"
+        summary_value "System Flatpak updates available" "$FLATPAK_SYSTEM_UPDATES_COUNT"
+        summary_value "User Flatpak updates available" "$FLATPAK_USER_UPDATES_COUNT"
+        summary_value "High-priority configuration files" "$CONFIG_HIGH_COUNT"
+        summary_value "Total configuration files" "$CONFIG_TOTAL_COUNT"
+        summary_value "Relevant failed units" "$RELEVANT_FAILED_COUNT"
+        summary_value "Ignored failed units" "$IGNORED_FAILED_COUNT"
+        summary_value "Unread Arch news" "$UNREAD_NEWS_COUNT"
+        summary_value "Reboot required" "$REBOOT_REQUIRED"
+    fi
+
+    summary_value "Warnings" "$warning_count"
+    summary_value "Errors" "$error_count"
+    summary_value "Duration" "${duration}s"
+
+    print_messages "Warnings" "${WARNING_MESSAGES[@]}"
+    print_messages "Errors" "${ERROR_MESSAGES[@]}"
+}
+
+# Determine final exit status
+final_exit_status() {
+    if (( ${#ERROR_MESSAGES[@]} > 0 )); then
+        return 1
+    fi
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Main execution modes
+# -----------------------------------------------------------------------------
+
+# Run read-only mode (audit or plan)
+run_read_only_mode() {
+    run_full_audit
+    if (( REQUIRED_MISSING == 0 )); then
+        check_arch_news
+        discover_updates
+        check_restart_requirement
+        if [[ "$MODE" == "plan" ]]; then
+            print_update_plan
+        fi
+    fi
+    print_summary
+    final_exit_status
+}
+
+# Run update mode
+run_update_mode() {
+    local repository_ok=0
+
+    # Audit before updates
+    run_full_audit
+    if (( REQUIRED_MISSING == 0 )); then
+        check_arch_news
+        discover_updates
+    fi
+
+    # Block if audit failed
+    if (( BLOCKING_FAILURES > 0 || REQUIRED_MISSING != 0 )); then
+        REPO_TRANSACTION_STATUS="blocked by audit"
+        AUR_TRANSACTION_STATUS="blocked by audit"
+        FLATPAK_SYSTEM_TRANSACTION_STATUS="blocked by audit"
+        FLATPAK_USER_TRANSACTION_STATUS="blocked by audit"
+        error "update.blocked" \
+            "Package changes were aborted because the safety audit has blocking failures."
+        check_restart_requirement
+        prompt_read_news
+        print_summary
+        final_exit_status
+        return
+    fi
+
+    # Temporarily disable Informant hooks
+    mask_informant_hooks || true
+
+    # Run repository update
+    if run_official_update; then
+        repository_ok=1
+        # Re-disable Informant hooks (may have been reinstalled by pacman)
+        mask_informant_hooks || true
+        run_aur_update
+        # Re-disable Informant hooks again (AUR update may have changed them)
+        mask_informant_hooks || true
+    else
+        AUR_TRANSACTION_STATUS="skipped after repository failure"
+        warn "transaction.aur.skipped" \
+            "AUR update was skipped because the repository transaction failed."
+    fi
+
+    # Run Flatpak updates
+    run_flatpak_updates
+
+    # Maintenance tasks only if repository update succeeded
+    if (( repository_ok == 1 )); then
+        handle_orphans
+        clean_pacman_cache
+    else
+        info "Pacman orphan and cache maintenance were skipped after repository failure."
+    fi
+
+    # Restore Informant hooks
+    if ! restore_informant_hooks "no"; then
+        error "informant.hook.restore" \
+            "One or more Informant hook overrides could not be restored."
+    fi
+
+    # Post-update checks
+    rescan_post_update_health
+    check_restart_requirement
+    prompt_read_news
+    print_summary
+    final_exit_status
+}
+
+# -----------------------------------------------------------------------------
+# Script entry point
+# -----------------------------------------------------------------------------
+
+main() {
+    local parse_rc=0
+
+    START_EPOCH=$(date +%s)
+    init_output
+
+    # Parse command line arguments
+    parse_args "$@" || parse_rc=$?
+    if (( parse_rc != 0 )); then
+        return "$parse_rc"
+    fi
+
+    # Ensure script is not run as root
+    if (( EUID == 0 )); then
+        printf '[FAIL] %s must be run as a normal user, never directly as root.\n' \
+            "$SCRIPT_NAME" >&2
+        return 1
+    fi
+
+    # Handle help and version modes early
+    case "$MODE" in
+        help)
+            usage
+            return 0
+            ;;
+        version)
+            version
+            return 0
+            ;;
+    esac
+
+    # Ensure required utilities are available
+    if ! command -v flock >/dev/null 2>&1; then
+        printf '[FAIL] Required command is missing: flock\n' >&2
+        return 1
+    fi
+    if ! command -v mktemp >/dev/null 2>&1; then
+        printf '[FAIL] Required base command is missing: mktemp\n' >&2
+        return 1
+    fi
+
+    # Acquire lock and set up environment
+    acquire_lock || return 1
+    create_temp_dir || return 1
+    install_traps
+    print_header
+
+    # Acquire sudo credentials
+    if ! authorize_sudo; then
+        print_summary
+        return 1
+    fi
+
+    # Execute requested mode
+    case "$MODE" in
+        audit|plan)
+            run_read_only_mode
+            ;;
+        update)
+            run_update_mode
+            ;;
+    esac
+}
+
+# Invoke main with all arguments
+main "$@"
