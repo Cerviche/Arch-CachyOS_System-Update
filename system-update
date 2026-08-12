@@ -26,7 +26,7 @@ set -u -o pipefail
 
 # Script identification
 readonly SCRIPT_NAME="system-update"
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.2.0"
 
 # Storage thresholds (in MiB)
 readonly ROOT_BLOCK_MIB=1024          # Minimum free space on / before blocking updates
@@ -1401,7 +1401,7 @@ discover_flatpak_scope() {
         return
     fi
 
-    if flatpak remote-ls --updates "$scope" --columns=application,name \
+    if flatpak remote-ls "$scope" --updates --columns=application,name \
         > "$output_file" 2> "${output_file}.err"; then
         count=$(count_nonempty_lines "$output_file")
         printf -v "$count_var" '%s' "$count"
@@ -1413,6 +1413,21 @@ discover_flatpak_scope() {
             "Unable to discover $label Flatpak updates."
         indent_file "${output_file}.err"
     fi
+}
+
+# Discover Flatpak updates across system and user scopes
+discover_flatpak_updates() {
+    if [[ "${HAVE[flatpak]:-0}" != "1" ]]; then
+        FLATPAK_SYSTEM_UPDATES_COUNT="unavailable"
+        FLATPAK_USER_UPDATES_COUNT="unavailable"
+        info "Flatpak is not installed; skipping Flatpak discovery."
+        return
+    fi
+
+    discover_flatpak_scope "--system" "system" "$TEMP_DIR/flatpak-system-updates.txt" \
+        FLATPAK_SYSTEM_HAS_REFS FLATPAK_SYSTEM_UPDATES_COUNT FLATPAK_SYSTEM_DISCOVERY_OK
+    discover_flatpak_scope "--user" "user" "$TEMP_DIR/flatpak-user-updates.txt" \
+        FLATPAK_USER_HAS_REFS FLATPAK_USER_UPDATES_COUNT FLATPAK_USER_DISCOVERY_OK
 }
 
 # Discover all available updates
@@ -1567,6 +1582,11 @@ update_flatpak_scope() {
     local label=$2
     local has_refs=$3
     local status_var=$4
+    local -a cmd=(flatpak)
+
+    if [[ "$scope" == "--system" ]]; then
+        cmd=(sudo flatpak)
+    fi
 
     if (( has_refs == 0 )); then
         printf -v "$status_var" '%s' "not applicable; no refs"
@@ -1575,12 +1595,12 @@ update_flatpak_scope() {
     fi
 
     info "Updating $label Flatpaks."
-    if flatpak update "$scope" --noninteractive -y; then
+    if "${cmd[@]}" update "$scope" --noninteractive -y; then
         printf -v "$status_var" '%s' "completed"
         ok "$label Flatpak update completed."
 
         # Remove unused runtimes
-        if flatpak uninstall "$scope" --unused --noninteractive -y; then
+        if "${cmd[@]}" uninstall "$scope" --unused --noninteractive -y; then
             ok "Unused $label Flatpak runtimes were processed."
         else
             warn "flatpak.${label}.unused" \
